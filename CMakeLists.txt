@@ -52,6 +52,7 @@ install ( TARGETS columnar_api EXPORT ColumnarExport COMPONENT module )
 # ensure ALL externally required headers are exported here
 install ( FILES columnar/builder.h columnar/columnar.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${CPACK_PACKAGE_NAME}/columnar COMPONENT dev )
 install ( FILES util/util.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${CPACK_PACKAGE_NAME}/util COMPONENT dev )
+install ( FILES secondary/sidx.h secondary/common.h secondary/builder.h secondary/iterator.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${CPACK_PACKAGE_NAME}/secondary COMPONENT dev )
 
 add_library ( columnar::columnar_api ALIAS columnar_api )
 
@@ -94,6 +95,7 @@ if (TARGET FastPFOR::FastPFOR)
 
 	# main internal interface target to collect all includes/links/dependencies
 	add_library ( columnar_root INTERFACE )
+	add_library ( secondary_root INTERFACE )
 
 	if (COVERAGE_TEST)
 		target_compile_options ( columnar_root INTERFACE $<${GNUC_CXX}:-fprofile-arcs -ftest-coverage> )
@@ -113,9 +115,12 @@ if (TARGET FastPFOR::FastPFOR)
 	target_link_libraries ( columnar_root INTERFACE columnar_api )
 	target_include_directories ( columnar_root INTERFACE columnar util )
 	set_property ( TARGET columnar_root PROPERTY INTERFACE_POSITION_INDEPENDENT_CODE TRUE )
+	target_include_directories ( secondary_root INTERFACE ${CMAKE_CURRENT_SOURCE_DIR} util )
+	set_property ( TARGET secondary_root PROPERTY INTERFACE_POSITION_INDEPENDENT_CODE TRUE )
 
 	add_subdirectory ( util )
 	add_subdirectory ( columnar )
+	add_subdirectory ( secondary )
 
 	SET ( MODULES_DIR "${CMAKE_INSTALL_DATADIR}/manticore/modules" )
 
