@@ -1,1 +1,1 @@
-GIT_REPOSITORY https://github.com/tomatolog/manticoresearch.git GIT_TAG 209ca1d
+GIT_REPOSITORY https://github.com/tomatolog/manticoresearch.git GIT_TAG 4e014e8
