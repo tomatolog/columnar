@@ -28,6 +28,11 @@ set ( _CMAKE_BUILD_TYPE ${CMAKE_BUILD_TYPE} )
 # The below version is used for versioning of the package and is replaced by the version from the pack workflow
 project ( columnar VERSION 0.0.0 )
 
+set ( COLUMNAR_EMBEDDED_BUILD OFF )
+if (NOT "${columnar_SOURCE_DIR}" STREQUAL "${CMAKE_SOURCE_DIR}")
+	set ( COLUMNAR_EMBEDDED_BUILD ON )
+endif ()
+
 # sometimes CMAKE_BUILD_TYPE became set after PROJECT statement, undo it.
 if (NOT _CMAKE_BUILD_TYPE AND CMAKE_BUILD_TYPE)
 	unset ( CMAKE_BUILD_TYPE CACHE )
@@ -237,7 +242,7 @@ include ( GNUInstallDirs )
 set (MODULES_DIR "${CMAKE_INSTALL_DATADIR}/${REL_MODULES_DIR}")
 
 is_amd64 ( AMD )
-if ((INSTALL_COLUMNAR OR INSTALL_SECONDARY OR INSTALL_KNN ) AND AMD AND NOT USE_AVX2)
+if ((INSTALL_COLUMNAR OR INSTALL_SECONDARY OR INSTALL_KNN ) AND AMD AND NOT USE_AVX2 AND NOT COLUMNAR_EMBEDDED_BUILD)
 	set (ADD_AVX_BUILDS 1)
 endif()
 
@@ -320,5 +325,7 @@ if (INSTALL_KNN)
 	set ( CPACK_COMPONENT_KNN_DEPENDS embeddings )
 endif ()
 
-include ( CPack )
+if (NOT COLUMNAR_EMBEDDED_BUILD)
+	include ( CPack )
+endif ()
 include ( testing.cmake )

@@ -21,7 +21,7 @@ endif ()
 set ( __build_embeddings_included YES )
 
 function(build_embeddings_lib)
-	message ( STATUS "building embeddings locally..." )
+	message ( STATUS "Configuring local embeddings build target..." )
 
 	# Set platform-specific library file names
 	if(WIN32)
@@ -42,48 +42,62 @@ function(build_embeddings_lib)
 		endif ()
 	endif ()
 
-	# Pass git commit and timestamp to build.rs via environment variables
-	# These variables are set by cmake/rev.cmake which is included in the main CMakeLists.txt
-	# The build.rs script uses these to generate a version string in the format:
-	# "VERSION commit@timestamp" (e.g., "1.1.0 38f499e@25112313")
-	# This matches the format used by other Manticore libraries for consistent version display
-	set(ENV{GIT_COMMIT_ID} "${GIT_COMMIT_ID}")
-	set(ENV{GIT_TIMESTAMP_ID} "${GIT_TIMESTAMP_ID}")
-
-	# Enable platform-specific BLAS acceleration for candle when available
-	set(EMBEDDINGS_CARGO_FEATURES "")
+	# Enable platform-specific features for embeddings.
+	set(EMBEDDINGS_CARGO_FEATURE_LIST "")
 	if(APPLE)
-		set(EMBEDDINGS_CARGO_FEATURES "--features" "accelerate")
+		list(APPEND EMBEDDINGS_CARGO_FEATURE_LIST "accelerate")
+	elseif(WIN32)
+		list(APPEND EMBEDDINGS_CARGO_FEATURE_LIST "download-ort")
 	elseif(UNIX)
 		# MKL provides multi-threaded BLAS on Linux; skip if not available
 		execute_process(COMMAND pkg-config --exists mkl-dynamic-lp64-seq RESULT_VARIABLE MKL_FOUND OUTPUT_QUIET ERROR_QUIET)
 		if(MKL_FOUND EQUAL 0)
-			set(EMBEDDINGS_CARGO_FEATURES "--features" "mkl")
+			list(APPEND EMBEDDINGS_CARGO_FEATURE_LIST "mkl")
 		endif()
 	endif()
-
-	execute_process (
-			COMMAND cargo build --manifest-path ${CMAKE_SOURCE_DIR}/embeddings/Cargo.toml --lib --release ${EMBEDDINGS_CARGO_FEATURES} --target-dir ${CMAKE_CURRENT_BINARY_DIR}/embeddings
-			RESULT_VARIABLE CMD_RESULT
-	)
-
-	if (NOT CMD_RESULT EQUAL 0)
-		message ( FATAL_ERROR "Failed to build: ${CMD_RESULT}" )
-	endif ()
+	if(EMBEDDINGS_CARGO_FEATURE_LIST)
+		list(JOIN EMBEDDINGS_CARGO_FEATURE_LIST "," EMBEDDINGS_CARGO_FEATURES_JOINED)
+		set(EMBEDDINGS_CARGO_FEATURES "--features" "${EMBEDDINGS_CARGO_FEATURES_JOINED}")
+	endif()
 
 	set(EMBEDDINGS_LIB_SRC_PATH "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_FILE_SRC}")
 	set(EMBEDDINGS_LIB_DST_PATH "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_FILE_DST}")
-	
-	# Check that the library file exists before attempting to rename it.
-	# This provides a clearer error message if EMBEDDINGS_LIB_NAME was not set correctly
-	# or if the cargo build produced a different filename than expected.
-	if (NOT EXISTS "${EMBEDDINGS_LIB_SRC_PATH}")
-		message ( FATAL_ERROR "Expected library file not found: ${EMBEDDINGS_LIB_SRC_PATH}" )
-	endif ()
-	
-	file(RENAME "${EMBEDDINGS_LIB_SRC_PATH}" "${EMBEDDINGS_LIB_DST_PATH}")
-	if ( EXISTS "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_NAME}.pdb" )
-		file(RENAME "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_NAME}.pdb" "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/lib_${EMBEDDINGS_LIB_NAME}.pdb")
-	endif()
-endfunction ()
 
+	file(GLOB_RECURSE EMBEDDINGS_RUST_SOURCES CONFIGURE_DEPENDS
+			"${columnar_SOURCE_DIR}/embeddings/*.toml"
+			"${columnar_SOURCE_DIR}/embeddings/Cargo.lock"
+			"${columnar_SOURCE_DIR}/embeddings/build.rs"
+			"${columnar_SOURCE_DIR}/embeddings/src/*.rs"
+	)
+
+	set(EMBEDDINGS_VERSION_STAMP "${CMAKE_CURRENT_BINARY_DIR}/embeddings/version.stamp")
+	set(EMBEDDINGS_VERSION_STAMP_CONTENT "${GIT_COMMIT_ID}\n${GIT_TIMESTAMP_ID}\n${EMBEDDINGS_CARGO_FEATURES_JOINED}\n")
+	if (EXISTS "${EMBEDDINGS_VERSION_STAMP}")
+		file(READ "${EMBEDDINGS_VERSION_STAMP}" EMBEDDINGS_CURRENT_VERSION_STAMP)
+	endif()
+	if (NOT EMBEDDINGS_CURRENT_VERSION_STAMP STREQUAL EMBEDDINGS_VERSION_STAMP_CONTENT)
+		file(WRITE "${EMBEDDINGS_VERSION_STAMP}" "${EMBEDDINGS_VERSION_STAMP_CONTENT}")
+	endif()
+
+	add_custom_command(
+			OUTPUT "${EMBEDDINGS_LIB_DST_PATH}"
+			COMMAND ${CMAKE_COMMAND} -E env "GIT_COMMIT_ID=${GIT_COMMIT_ID}" "GIT_TIMESTAMP_ID=${GIT_TIMESTAMP_ID}"
+				${CARGO_COMMAND} build --manifest-path "${columnar_SOURCE_DIR}/embeddings/Cargo.toml" --lib --release ${EMBEDDINGS_CARGO_FEATURES} --target-dir "${CMAKE_CURRENT_BINARY_DIR}/embeddings"
+			COMMAND ${CMAKE_COMMAND}
+				-DEMBEDDINGS_LIB_SRC_PATH=${EMBEDDINGS_LIB_SRC_PATH}
+				-DEMBEDDINGS_LIB_DST_PATH=${EMBEDDINGS_LIB_DST_PATH}
+				-DEMBEDDINGS_PDB_SRC_PATH=${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_NAME}.pdb
+				-DEMBEDDINGS_PDB_DST_PATH=${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/lib_${EMBEDDINGS_LIB_NAME}.pdb
+				-P "${columnar_SOURCE_DIR}/cmake/copy_embeddings_artifacts.cmake"
+			DEPENDS ${EMBEDDINGS_RUST_SOURCES} "${EMBEDDINGS_VERSION_STAMP}"
+			COMMENT "Building manticoresearch text embeddings library"
+			VERBATIM
+	)
+
+	if (NOT TARGET manticore_knn_embeddings)
+		add_custom_target(manticore_knn_embeddings ALL DEPENDS "${EMBEDDINGS_LIB_DST_PATH}")
+	endif()
+
+	set(EMBEDDINGS_LIB "${EMBEDDINGS_LIB_DST_PATH}" PARENT_SCOPE)
+	set(MANTICORE_KNN_EMBEDDINGS_LIB "${EMBEDDINGS_LIB_DST_PATH}" CACHE INTERNAL "Path to manticoresearch text embeddings library" FORCE)
+endfunction ()

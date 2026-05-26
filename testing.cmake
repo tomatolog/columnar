@@ -13,19 +13,17 @@ if ((NOT TARGET columnar_lib) AND (NOT TARGET secondary_index))
 	return ()
 endif ()
 
+set ( COLUMNAR_EMBEDDED_BUILD OFF )
+if (NOT "${columnar_SOURCE_DIR}" STREQUAL "${CMAKE_SOURCE_DIR}")
+	set ( COLUMNAR_EMBEDDED_BUILD ON )
+endif ()
+
 # cb called by manticore ubertest adding tests - add special columnar\secondary-pass for rt tests
 function ( special_ubertest_addtest testN tst_name REQUIRES )
 	if (NOT NON-RT IN_LIST REQUIRES AND NOT NON-COLUMNAR IN_LIST REQUIRES)
 		add_ubertest ( "${testN}" "${tst_name}" "${REQUIRES}" "col" "COLUMNAR" "--rt --ignore-weights --columnar" )
 	elseif (NOT NON-SECONDARY IN_LIST REQUIRES)
 		add_ubertest ( "${testN}" "${tst_name}" "${REQUIRES}" "secondary" "SECONDARY" "" )
-	endif ()
-endfunction ()
-
-function ( special_ubertest_filter accept_var explain_var REQUIRES )
-	if ((NOT COLUMNAR IN_LIST REQUIRES) AND (NOT SECONDARY IN_LIST REQUIRES))
-		set ( ${accept_var} 0 PARENT_SCOPE )
-		set ( ${explain_var} "not specially columnar" PARENT_SCOPE )
 	endif ()
 endfunction ()
 
@@ -54,6 +52,18 @@ elseif ( TARGET embeddings )
 		message ( STATUS "Using manticoresearch text embeddings library for tests: ${EMBEDDINGS_LIB_PATH}" )
 	endif ()
 endif ()
+
+if (COLUMNAR_EMBEDDED_BUILD)
+	message ( STATUS "Using embedded MCL runtime targets for daemon tests" )
+	return ()
+endif ()
+
+function ( special_ubertest_filter accept_var explain_var REQUIRES )
+	if ((NOT COLUMNAR IN_LIST REQUIRES) AND (NOT SECONDARY IN_LIST REQUIRES))
+		set ( ${accept_var} 0 PARENT_SCOPE )
+		set ( ${explain_var} "not specially columnar" PARENT_SCOPE )
+	endif ()
+endfunction ()
 
 set ( TEST_SPECIAL_EXTERNAL ON )
 
