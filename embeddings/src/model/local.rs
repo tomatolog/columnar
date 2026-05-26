@@ -103,7 +103,7 @@ impl SessionWrapper {
     /// and drop of SessionOutputs. Prevents the race where another thread calls
     /// run() while outputs are still being consumed.
     fn with_session<R>(&self, f: impl FnOnce(&mut ort::session::Session) -> R) -> R {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         f(unsafe { &mut *guard.get() })
     }
 }
@@ -401,9 +401,16 @@ pub fn load_tokenizer(path: &PathBuf) -> Result<Tokenizer, Box<dyn Error>> {
     Tokenizer::from_bytes(&bytes).map_err(|_| LibError::ModelTokenizerLoadFailed.into())
 }
 
-/// BERT-style local embedding model
+/// BERT-style local embedding model.
+///
+/// `model` is `Arc<Mutex<BertModel>>` to match T5/Causal/Quantized — candle's
+/// BertModel takes `&self` on forward but concurrent forward calls produced
+/// flaky crashes in the daemon when multiple INSERTs / queries hit the same
+/// model in parallel. Serialising forward here mirrors the other model types'
+/// existing posture and trades nothing measurable on perf (uncontended Mutex
+/// is sub-100ns; a BERT forward is six orders of magnitude more).
 pub struct BertEmbeddingModel {
-    model: BertModel,
+    model: Arc<Mutex<BertModel>>,
     tokenizer: Tokenizer,
     max_input_len: usize,
     hidden_size: usize,
@@ -440,7 +447,7 @@ impl BertEmbeddingModel {
         let model = BertModel::load(vb, &config).map_err(|_| LibError::ModelLoadFailed)?;
 
         Ok(Self {
-            model,
+            model: Arc::new(Mutex::new(model)),
             tokenizer: tokenizer.clone(),
             max_input_len,
             hidden_size,
@@ -454,6 +461,43 @@ impl BertEmbeddingModel {
         let mut all_embeddings = Vec::with_capacity(chunks.len());
 
         for batch in chunks.chunks(batch_size()) {
+            // Fast path for batch-of-1 (daemon's SELECT KNN(text,...) hot path):
+            // no padding needed, so skip the attention_mask multiply and use a
+            // plain sum/scalar-div mean pool. Matches pre-975b294 behavior.
+            //
+            // Lock scope covers ALL candle ops (forward + pool + to_vec1), not
+            // just forward. Under concurrent inserts the daemon calls predict
+            // from multiple threads; candle/MKL tensor ops on output tensors
+            // that alias internal forward storage are not safe to run while
+            // another thread re-enters forward. Holding the lock until the
+            // f32 data has been copied into an owned Vec eliminates the race.
+            if batch.len() == 1 {
+                let chunk = &batch[0];
+                let token_ids = Tensor::new(chunk.as_slice(), &self.device)?.unsqueeze(0)?;
+                let token_type_ids = token_ids.zeros_like()?;
+                let mut emb_vec: Vec<f32> = {
+                    let model = self.model.lock().unwrap_or_else(|e| e.into_inner());
+                    let emb = model.forward(&token_ids, &token_type_ids, None)?;
+                    let seq_len = token_ids.dims()[1];
+                    let summed = emb.sum(1)?.to_dtype(DType::F32)?;
+                    let divisor = Tensor::new(seq_len as f32, &self.device)?;
+                    let mean_emb = summed.broadcast_div(&divisor)?;
+                    // .contiguous() forces candle's to_vec1 to take its
+                    // contiguous-offsets path (slice::to_vec, cap == len).
+                    // The strided path uses Iterator::collect, which can
+                    // produce Vec with cap > len from FromIterator growth
+                    // doubling — that would mean the (ptr, len, cap) we
+                    // hand across FFI doesn't match the canonical layout
+                    // glibc expects when Vec::from_raw_parts drops on the
+                    // C++ side via free_vec_result. Eliminate the path
+                    // dependency entirely.
+                    mean_emb.get(0)?.contiguous()?.to_vec1::<f32>()?
+                };
+                normalize(&mut emb_vec);
+                all_embeddings.push(emb_vec);
+                continue;
+            }
+
             let batch_size = batch.len();
             let max_len = batch.iter().map(|c| c.len()).max().unwrap_or(0);
 
@@ -473,23 +517,37 @@ impl BertEmbeddingModel {
                 Tensor::from_vec(flat_mask.clone(), (batch_size, max_len), &self.device)?;
             let token_type_ids = token_ids.zeros_like()?;
 
-            let emb = self
-                .model
-                .forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
-            // emb: [batch_size, max_len, hidden_size]
+            // Lock scope intentionally covers forward + the full mean-pool
+            // pipeline + every per-row to_vec1. See the batch-of-1 fast path
+            // comment above for the concurrency rationale: post-forward tensor
+            // ops on candle outputs are not safe to run while another thread
+            // re-enters forward on the same BertModel.
+            let mut batch_embeddings: Vec<Vec<f32>> = {
+                let model = self.model.lock().unwrap_or_else(|e| e.into_inner());
+                let emb = model.forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
+                // emb: [batch_size, max_len, hidden_size]
 
-            // Attention-mask-aware mean pooling: sum(emb * mask) / sum(mask)
-            let mask_expanded = attention_mask.unsqueeze(2)?; // [batch, max_len, 1]
-            let masked_emb = emb.broadcast_mul(&mask_expanded)?;
-            let summed = masked_emb.sum(1)?.to_dtype(DType::F32)?; // [batch, hidden]
-            let token_counts = attention_mask.sum(1)?.unsqueeze(1)?; // [batch, 1]
-            let mean_emb = summed.broadcast_div(&token_counts)?;
+                // Attention-mask-aware mean pooling: sum(emb * mask) / sum(mask)
+                let mask_expanded = attention_mask.unsqueeze(2)?; // [batch, max_len, 1]
+                let masked_emb = emb.broadcast_mul(&mask_expanded)?;
+                let summed = masked_emb.sum(1)?.to_dtype(DType::F32)?; // [batch, hidden]
+                let token_counts = attention_mask.sum(1)?.unsqueeze(1)?; // [batch, 1]
+                let mean_emb = summed.broadcast_div(&token_counts)?;
 
-            for i in 0..batch_size {
-                let mut emb_vec: Vec<f32> = mean_emb.get(i)?.to_vec1::<f32>()?;
-                normalize(&mut emb_vec);
-                all_embeddings.push(emb_vec);
+                let mut out = Vec::with_capacity(batch_size);
+                for i in 0..batch_size {
+                    // See contiguous() rationale on the batch-of-1 fast path
+                    // above — same FFI cap/len invariant requirement applies
+                    // to each row pulled out of the batched mean_emb.
+                    out.push(mean_emb.get(i)?.contiguous()?.to_vec1::<f32>()?);
+                }
+                out
+            };
+
+            for emb_vec in batch_embeddings.iter_mut() {
+                normalize(emb_vec);
             }
+            all_embeddings.extend(batch_embeddings);
         }
 
         Ok(all_embeddings)
@@ -1013,10 +1071,18 @@ impl OnnxEmbeddingModel {
                 .collect();
 
             for handle in handles {
-                match handle.join().unwrap() {
-                    Ok(embs) => ordered_results.push(embs),
-                    Err(e) => {
+                // `join().unwrap()` would panic if the worker thread itself
+                // panicked — and that panic would unwind through rayon's
+                // scope into the FFI caller. Convert a panicked worker into
+                // a normal Err instead.
+                match handle.join() {
+                    Ok(Ok(embs)) => ordered_results.push(embs),
+                    Ok(Err(e)) => {
                         error = Some(e);
+                        break;
+                    }
+                    Err(_) => {
+                        error = Some(LibError::OnnxModelEvalFailed);
                         break;
                     }
                 }
@@ -1119,15 +1185,22 @@ impl LocalModel {
             .map(|t| pre_truncate_text(t, max_input_len))
             .collect();
 
-        // Enable parallel tokenization via rayon (once)
-        static INIT_PARALLEL: std::sync::Once = std::sync::Once::new();
-        INIT_PARALLEL.call_once(|| {
-            std::env::set_var("TOKENIZERS_PARALLELISM", "true");
-        });
-
-        let encodings = tokenizer
-            .encode_batch(texts, true)
-            .map_err(|_| LibError::ModelTokenizerEncodeFailed)?;
+        // Adaptive tokenization: encode_batch fans out via rayon, which is pure
+        // overhead for small batches. The daemon's SELECT KNN(text,...) hot path
+        // always sends batch=1 — go sequential there. Parallelise only when the
+        // batch is big enough to amortise the rayon dispatch. Threshold mirrors
+        // the ONNX path's "no threading overhead" cutoff.
+        let encodings = if texts.len() > batch_size() {
+            tokenizer
+                .encode_batch(texts, true)
+                .map_err(|_| LibError::ModelTokenizerEncodeFailed)?
+        } else {
+            texts
+                .iter()
+                .map(|t| tokenizer.encode(*t, true))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| LibError::ModelTokenizerEncodeFailed)?
+        };
 
         let truncated: Vec<Vec<u32>> = encodings
             .iter()
@@ -1151,6 +1224,39 @@ impl TextModel for LocalModel {
         // BERT and ONNX: batched path (batch_size up to batch_size() per forward pass)
         match self {
             LocalModel::Bert(m) => {
+                // Dedicated single-text bypass: SELECT KNN(field, k, 'text') hits this
+                // path on every query. Skip all batching wrappers, intermediate Vecs,
+                // and the chunks.chunks() loop — go straight encode → forward → pool.
+                //
+                // Lock scope covers the full candle pipeline through to_vec1; see
+                // BertEmbeddingModel::predict_chunks for the concurrency rationale.
+                if texts.len() == 1 {
+                    let text = pre_truncate_text(texts[0], m.max_input_len);
+                    let enc = m
+                        .tokenizer
+                        .encode(text, true)
+                        .map_err(|_| LibError::ModelTokenizerEncodeFailed)?;
+                    let ids = enc.get_ids();
+                    let ids = &ids[..ids.len().min(m.max_input_len)];
+
+                    let token_ids = Tensor::new(ids, &m.device)?.unsqueeze(0)?;
+                    let token_type_ids = token_ids.zeros_like()?;
+                    let mut emb_vec: Vec<f32> = {
+                        let model = m.model.lock().unwrap_or_else(|e| e.into_inner());
+                        let emb = model.forward(&token_ids, &token_type_ids, None)?;
+                        let seq_len = token_ids.dims()[1];
+                        let summed = emb.sum(1)?.to_dtype(DType::F32)?;
+                        let divisor = Tensor::new(seq_len as f32, &m.device)?;
+                        let mean_emb = summed.broadcast_div(&divisor)?;
+                        // See contiguous() rationale on
+                        // BertEmbeddingModel::predict_chunks above. Same FFI
+                        // canonical-layout invariant required here.
+                        mean_emb.get(0)?.contiguous()?.to_vec1::<f32>()?
+                    };
+                    normalize(&mut emb_vec);
+                    return Ok(vec![emb_vec]);
+                }
+
                 return Self::predict_batched(&m.tokenizer, m.max_input_len, texts, |chunks| {
                     m.predict_chunks(chunks)
                 });
@@ -1202,7 +1308,7 @@ impl TextModel for LocalModel {
                 let token_ids = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
                 let embeddings = match self {
                     LocalModel::T5(m) => {
-                        let mut model = m.model.lock().unwrap();
+                        let mut model = m.model.lock().unwrap_or_else(|e| e.into_inner());
                         let emb = model.forward(&token_ids)?;
                         let cls_emb = emb.i(0)?;
                         let first_token = cls_emb.i(0)?;
@@ -1250,7 +1356,7 @@ impl TextModel for LocalModel {
                     },
                     LocalModel::Quantized(m) => match &m.model {
                         QuantizedModelKind::Gemma { model } => {
-                            let mut model = model.lock().unwrap();
+                            let mut model = model.lock().unwrap_or_else(|e| e.into_inner());
                             let emb = model.forward(&token_ids, 0)?;
                             let (_, n_tokens, _) = emb.dims3()?;
                             let summed = emb.sum(1)?.to_dtype(DType::F32)?;
@@ -1258,7 +1364,7 @@ impl TextModel for LocalModel {
                             summed.broadcast_div(&divisor)?
                         }
                         QuantizedModelKind::Llama { model } => {
-                            let mut model = model.lock().unwrap();
+                            let mut model = model.lock().unwrap_or_else(|e| e.into_inner());
                             let emb = model.forward(&token_ids, 0)?;
                             let (_, n_tokens, _) = emb.dims3()?;
                             let summed = emb.sum(1)?.to_dtype(DType::F32)?;
@@ -1270,7 +1376,12 @@ impl TextModel for LocalModel {
                 };
 
                 if let Ok(e_j) = embeddings.get(0) {
+                    // See contiguous() rationale on BertEmbeddingModel above.
+                    // Same FFI canonical-layout invariant for T5 / Causal /
+                    // Quantized sequential output.
                     let emb_vec: Vec<f32> = e_j
+                        .contiguous()
+                        .map_err(|e| -> Box<dyn Error> { Box::new(e) })?
                         .to_vec1::<f32>()
                         .map_err(|e| -> Box<dyn Error> { Box::new(e) })?;
                     let mut emb = emb_vec;
