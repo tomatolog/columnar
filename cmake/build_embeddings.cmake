@@ -40,7 +40,7 @@ function(prepare_embeddings_ort)
 		set ( _arch "x64" )
 	endif()
 
-	embeddings_ort_download ( _lib_dir "${_platform}" "${_arch}" "${CMAKE_CURRENT_BINARY_DIR}/embeddings/ort" )
+	embeddings_ort_download ( _lib_dir "${_platform}" "${_arch}" "${MANTICORE_EMBEDDINGS_DEPS_DIR}/ort" )
 
 	set ( ENV{ORT_LIB_LOCATION} "${_lib_dir}" )
 	message ( STATUS "Using ORT_LIB_LOCATION=${_lib_dir}" )
@@ -75,6 +75,22 @@ function(build_embeddings_lib)
 	# This matches the format used by other Manticore libraries for consistent version display
 	set(ENV{GIT_COMMIT_ID} "${GIT_COMMIT_ID}")
 	set(ENV{GIT_TIMESTAMP_ID} "${GIT_TIMESTAMP_ID}")
+
+	if (NOT DEFINED MANTICORE_EMBEDDINGS_TARGET_DIR)
+		if (DEFINED ENV{CARGO_TARGET_DIR} AND NOT "$ENV{CARGO_TARGET_DIR}" STREQUAL "")
+			set(_embeddings_target_dir_default "$ENV{CARGO_TARGET_DIR}")
+		else()
+			set(_embeddings_target_dir_default "${columnar_SOURCE_DIR}/embeddings/target")
+		endif()
+		set(MANTICORE_EMBEDDINGS_TARGET_DIR "${_embeddings_target_dir_default}" CACHE PATH "Shared Cargo target directory for MCL embeddings")
+	endif()
+	if (NOT DEFINED MANTICORE_EMBEDDINGS_DEPS_DIR)
+		set(MANTICORE_EMBEDDINGS_DEPS_DIR "${MANTICORE_EMBEDDINGS_TARGET_DIR}/manticore-deps" CACHE PATH "Shared dependency cache directory for MCL embeddings")
+	endif()
+	file(MAKE_DIRECTORY "${MANTICORE_EMBEDDINGS_TARGET_DIR}" "${MANTICORE_EMBEDDINGS_DEPS_DIR}")
+	message ( STATUS "Using MANTICORE_EMBEDDINGS_TARGET_DIR=${MANTICORE_EMBEDDINGS_TARGET_DIR}" )
+	message ( STATUS "Using MANTICORE_EMBEDDINGS_DEPS_DIR=${MANTICORE_EMBEDDINGS_DEPS_DIR}" )
+
 	prepare_embeddings_ort()
 
 	# Enable platform-specific BLAS acceleration for candle when available.
@@ -108,7 +124,7 @@ function(build_embeddings_lib)
 		set(EMBEDDINGS_CARGO_FEATURE_ARGS "--features" "${EMBEDDINGS_FEATURES_CSV}")
 	endif()
 
-	set(EMBEDDINGS_LIB_SRC_PATH "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_FILE_SRC}")
+	set(EMBEDDINGS_LIB_SRC_PATH "${MANTICORE_EMBEDDINGS_TARGET_DIR}/release/${EMBEDDINGS_LIB_FILE_SRC}")
 	set(EMBEDDINGS_LIB_DST_PATH "${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_FILE_DST}")
 
 	file(GLOB_RECURSE EMBEDDINGS_RUST_SOURCES CONFIGURE_DEPENDS
@@ -119,7 +135,7 @@ function(build_embeddings_lib)
 	)
 
 	set(EMBEDDINGS_VERSION_STAMP "${CMAKE_CURRENT_BINARY_DIR}/embeddings/version.stamp")
-	set(EMBEDDINGS_VERSION_STAMP_CONTENT "${GIT_COMMIT_ID}\n${GIT_TIMESTAMP_ID}\n$ENV{ORT_LIB_LOCATION}\n$ENV{MKLROOT}\n${EMBEDDINGS_FEATURES_CSV}\n")
+	set(EMBEDDINGS_VERSION_STAMP_CONTENT "${GIT_COMMIT_ID}\n${GIT_TIMESTAMP_ID}\n$ENV{ORT_LIB_LOCATION}\n$ENV{MKLROOT}\n${EMBEDDINGS_FEATURES_CSV}\n${MANTICORE_EMBEDDINGS_TARGET_DIR}\n${MANTICORE_EMBEDDINGS_DEPS_DIR}\n")
 	if (EXISTS "${EMBEDDINGS_VERSION_STAMP}")
 		file(READ "${EMBEDDINGS_VERSION_STAMP}" EMBEDDINGS_CURRENT_VERSION_STAMP)
 	endif()
@@ -141,11 +157,11 @@ function(build_embeddings_lib)
 	add_custom_command(
 			OUTPUT "${EMBEDDINGS_LIB_DST_PATH}"
 			COMMAND ${CMAKE_COMMAND} -E env ${EMBEDDINGS_CARGO_ENV}
-				"${CARGO_COMMAND}" build --manifest-path "${columnar_SOURCE_DIR}/embeddings/Cargo.toml" --lib --release ${EMBEDDINGS_CARGO_FEATURE_ARGS} --target-dir "${CMAKE_CURRENT_BINARY_DIR}/embeddings"
+				"${CARGO_COMMAND}" build --manifest-path "${columnar_SOURCE_DIR}/embeddings/Cargo.toml" --lib --release ${EMBEDDINGS_CARGO_FEATURE_ARGS} --target-dir "${MANTICORE_EMBEDDINGS_TARGET_DIR}"
 			COMMAND ${CMAKE_COMMAND}
 				-DEMBEDDINGS_LIB_SRC_PATH=${EMBEDDINGS_LIB_SRC_PATH}
 				-DEMBEDDINGS_LIB_DST_PATH=${EMBEDDINGS_LIB_DST_PATH}
-				-DEMBEDDINGS_PDB_SRC_PATH=${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/${EMBEDDINGS_LIB_NAME}.pdb
+				-DEMBEDDINGS_PDB_SRC_PATH=${MANTICORE_EMBEDDINGS_TARGET_DIR}/release/${EMBEDDINGS_LIB_NAME}.pdb
 				-DEMBEDDINGS_PDB_DST_PATH=${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/lib_${EMBEDDINGS_LIB_NAME}.pdb
 				-P "${columnar_SOURCE_DIR}/cmake/copy_embeddings_artifacts.cmake"
 			DEPENDS ${EMBEDDINGS_RUST_SOURCES} "${EMBEDDINGS_VERSION_STAMP}"
