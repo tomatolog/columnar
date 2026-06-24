@@ -19,7 +19,7 @@ type LoadModelFn = extern "C" fn(
 type FreeModelResultFn = extern "C" fn(TextModelResult);
 
 type MakeVectEmbeddingsFn =
-    extern "C" fn(&TextModelWrapper, *const StringItem, usize) -> FloatVecResult;
+    extern "C" fn(&TextModelWrapper, *const StringItem, usize, i32) -> FloatVecResult;
 
 type FreeVecResultFn = extern "C" fn(FloatVecResult);
 
@@ -62,7 +62,7 @@ pub struct EmbedLib {
 const VERSION_STR: &[u8] = concat!(env!("EMBEDDINGS_VERSION_STR"), "\0").as_bytes();
 
 const LIB: EmbedLib = EmbedLib {
-    version: 3usize,
+    version: 4usize,
     version_str: VERSION_STR.as_ptr() as *const c_char,
     load_model: TextModelWrapper::load_model,
     free_model_result: TextModelWrapper::free_model_result,
@@ -76,24 +76,9 @@ const LIB: EmbedLib = EmbedLib {
 
 #[no_mangle]
 pub extern "C" fn GetLibFuncs() -> *const EmbedLib {
-    // Log panics to stderr (with location + payload) instead of silently
-    // discarding them. The previous no-op hook was hiding the root cause of
-    // FFI-boundary crashes; we still need catch_unwind at every extern "C"
-    // entry point (see text_model_wrapper.rs) to convert the unwind into a
-    // clean error return, but the hook here ensures the original panic site
-    // appears in the daemon's log before we swallow it.
-    std::panic::set_hook(Box::new(|info| {
-        let loc = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
-            .unwrap_or("<non-string payload>");
-        eprintln!("manticore-knn-embeddings: panic at {loc}: {payload}");
-    }));
+    // First call C++ makes after dlopen, so the hook is in place before any
+    // model call can panic. The hook records the panic site for the error
+    // strings returned by the catch_panic guards at every entry point.
+    crate::panic_guard::install_hook();
     &LIB
 }

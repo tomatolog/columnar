@@ -1,30 +1,7 @@
 use crate::model::{create_model, Model, ModelOptions, TextModel};
+use crate::panic_guard;
 use std::os::raw::c_char;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::{ffi::c_void, ptr};
-
-/// Build a Rust-allocated, NUL-terminated error string for FFI return.
-/// Falls back to a placeholder if the input itself contains a NUL byte
-/// (which would otherwise panic `CString::new`). Never panics.
-fn ffi_error_cstring(msg: &str) -> *mut c_char {
-    match std::ffi::CString::new(msg) {
-        Ok(c) => c.into_raw(),
-        Err(_) => std::ffi::CString::new("embeddings: error message contained NUL byte")
-            .expect("static string with no NUL")
-            .into_raw(),
-    }
-}
-
-/// Extract a printable panic message from a `catch_unwind` payload.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        format!("embeddings: panic caught at FFI boundary: {s}")
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        format!("embeddings: panic caught at FFI boundary: {s}")
-    } else {
-        "embeddings: panic caught at FFI boundary (non-string payload)".to_string()
-    }
-}
 
 /// Sentinel written at offset 0 of every live model handle. Lets FFI entry
 /// points detect garbage, null, or freed pointers handed in by the C++ caller
@@ -98,6 +75,16 @@ pub struct StringItem {
     pub len: usize,
 }
 
+/// Build a heap CString for the FFI error channel. Panic messages can contain
+/// interior NULs; strip them rather than fail — a panic on this path would
+/// unwind out of the catch handler and abort the process.
+fn to_c_error(msg: &str) -> *mut c_char {
+    std::ffi::CString::new(msg.replace('\0', "?"))
+        .map(|c| c.into_raw())
+        // Unreachable after the NUL strip, but never panic on this path.
+        .unwrap_or(ptr::null_mut())
+}
+
 impl TextModelWrapper {
     pub extern "C" fn load_model(
         name_ptr: *const c_char,
@@ -111,10 +98,7 @@ impl TextModelWrapper {
         api_timeout: i32, // 0 = unlimited, >0 = timeout in seconds
         use_gpu: bool,
     ) -> TextModelResult {
-        // catch_unwind: a Rust panic crossing into the C++ daemon is UB. Any
-        // panic in create_model / HF Hub / candle config parsing / etc. must
-        // be converted to a clean error-return TextModelResult.
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        panic_guard::catch_panic(|| {
             let name = unsafe {
                 let slice = std::slice::from_raw_parts(name_ptr as *mut u8, name_len);
                 std::str::from_utf8_unchecked(slice)
@@ -165,24 +149,25 @@ impl TextModelWrapper {
                     model: Box::into_raw(Box::new(ModelHandle::new(model))) as *mut c_void,
                     error: ptr::null_mut(),
                 },
-                Err(e) => TextModelResult {
-                    model: ptr::null_mut(),
-                    error: ffi_error_cstring(&e.to_string()),
-                },
+                Err(e) => {
+                    let c_error = std::ffi::CString::new(e.to_string()).unwrap();
+                    TextModelResult {
+                        model: ptr::null_mut(),
+                        error: c_error.into_raw(),
+                    }
+                }
             }
-        }));
-
-        match result {
-            Ok(r) => r,
-            Err(payload) => TextModelResult {
-                model: ptr::null_mut(),
-                error: ffi_error_cstring(&panic_message(&*payload)),
-            },
-        }
+        })
+        .unwrap_or_else(|msg| TextModelResult {
+            model: ptr::null_mut(),
+            error: to_c_error(&format!("embeddings: internal error (panic): {msg}")),
+        })
     }
 
     pub extern "C" fn free_model_result(res: TextModelResult) {
-        unsafe {
+        // A panic mid-free leaks the allocation; that beats unwinding into
+        // C++, which aborts the daemon. The panic hook has already logged it.
+        let _ = panic_guard::catch_panic(|| unsafe {
             if !res.model.is_null() {
                 // Drop runs ModelHandle::drop first (tombstones magic to
                 // MODEL_DEAD), then destroys the inner Model.
@@ -192,7 +177,7 @@ impl TextModelWrapper {
             if !res.error.is_null() {
                 let _ = std::ffi::CString::from_raw(res.error);
             }
-        }
+        });
     }
 
     /// Validate the handle pointer before dereferencing. Returns a static error
@@ -220,18 +205,15 @@ impl TextModelWrapper {
         &self,
         texts: *const StringItem,
         count: usize,
+        threads: i32, // 0 = use all available CPUs, >0 = cap thread count
     ) -> FloatVecResult {
-        // Hot path for `SELECT KNN(field, k, 'text')` and auto-embed INSERT.
-        // Any panic in candle / tokenizers / our own `.unwrap()`s would unwind
-        // across the C++ FFI boundary = undefined behaviour = daemon SIGSEGV.
-        // catch_unwind converts every panic into a clean FloatVecResult with
-        // the error set, so the daemon survives and can report it to SQL.
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        panic_guard::catch_panic(|| {
             let model = match self.as_model() {
                 Ok(m) => m,
                 Err(msg) => {
+                    let c_error = std::ffi::CString::new(msg).unwrap();
                     return FloatVecResult {
-                        error: ffi_error_cstring(msg),
+                        error: c_error.into_raw(),
                         ptr: ptr::null(),
                         len: 0,
                         cap: 0,
@@ -251,8 +233,10 @@ impl TextModelWrapper {
                 })
                 .collect();
 
+            let threads = if threads > 0 { threads as usize } else { 0 };
+
             let mut float_vec_list: Vec<FloatVec> = Vec::new();
-            let embeddings_list = model.predict(&string_refs);
+            let embeddings_list = model.predict(&string_refs, threads);
             let c_error = match embeddings_list {
                 Ok(embeddings_list) => {
                     for embeddings in embeddings_list.iter() {
@@ -268,7 +252,8 @@ impl TextModelWrapper {
                 }
                 Err(e) => {
                     // Don't push empty vector on error - return error through szError pattern
-                    ffi_error_cstring(&e.to_string())
+                    let c_error = std::ffi::CString::new(e.to_string()).unwrap();
+                    c_error.into_raw()
                 }
             };
 
@@ -280,21 +265,19 @@ impl TextModelWrapper {
             };
             std::mem::forget(float_vec_list);
             vec_result
-        }));
-
-        match result {
-            Ok(r) => r,
-            Err(payload) => FloatVecResult {
-                error: ffi_error_cstring(&panic_message(&*payload)),
-                ptr: ptr::null(),
-                len: 0,
-                cap: 0,
-            },
-        }
+        })
+        .unwrap_or_else(|msg| FloatVecResult {
+            error: to_c_error(&format!("embeddings: internal error (panic): {msg}")),
+            ptr: ptr::null(),
+            len: 0,
+            cap: 0,
+        })
     }
 
     pub extern "C" fn free_vec_result(result: FloatVecResult) {
-        unsafe {
+        // A panic mid-free leaks the buffers; that beats unwinding into C++,
+        // which aborts the daemon. The panic hook has already logged it.
+        let _ = panic_guard::catch_panic(|| unsafe {
             // Only process if we have valid data
             if !result.ptr.is_null() && result.len > 0 {
                 let slice = std::slice::from_raw_parts(result.ptr, result.len);
@@ -314,47 +297,51 @@ impl TextModelWrapper {
             if !result.error.is_null() {
                 let _ = std::ffi::CString::from_raw(result.error);
             }
-        }
+        });
     }
 
     pub extern "C" fn get_hidden_size(&self) -> usize {
-        // No error channel here; return 0 on a bad handle or unwind so the
-        // C++ caller sees an obviously-wrong dimension instead of UB. The
-        // remote model impls already return 0 instead of panicking when the
-        // dim is unknown; catch_unwind is a defense-in-depth guard so any
-        // future panic on this path can never unwind across FFI.
-        catch_unwind(AssertUnwindSafe(|| {
-            self.as_model().map(|m| m.get_hidden_size()).unwrap_or(0)
-        }))
-        .unwrap_or(0)
+        // No error channel here; return 0 on a bad handle or a panic so the
+        // C++ caller sees an obviously-wrong dimension instead of UB or an
+        // abort. The handle is already validated before any real work, so a 0
+        // here means the C++ side handed us an invalid pointer.
+        panic_guard::catch_panic(|| self.as_model().map(|m| m.get_hidden_size()).unwrap_or(0))
+            .unwrap_or(0)
     }
 
     pub extern "C" fn get_max_input_len(&self) -> usize {
-        self.as_model().map(|m| m.get_max_input_len()).unwrap_or(0)
+        panic_guard::catch_panic(|| self.as_model().map(|m| m.get_max_input_len()).unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Validates the API key by making a minimal test request to the API.
     /// Returns null on success, or an error message string on failure.
     /// The caller is responsible for freeing the error string using free_string().
     pub extern "C" fn validate_api_key(&self) -> *mut c_char {
-        // catch_unwind: HTTP / TLS / JSON parsing in API providers can panic
-        // on malformed responses. Convert any such panic to an error string
-        // instead of taking the daemon down.
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        panic_guard::catch_panic(|| {
             let model = match self.as_model() {
                 Ok(m) => m,
-                Err(msg) => return ffi_error_cstring(msg),
+                Err(msg) => {
+                    return std::ffi::CString::new(msg)
+                        .map(|c| c.into_raw())
+                        .unwrap_or(ptr::null_mut());
+                }
             };
             match model.validate_api_key() {
                 Ok(()) => ptr::null_mut(),
-                Err(e) => ffi_error_cstring(&e.to_string()),
+                Err(e) => {
+                    let error_str = e.to_string();
+                    let c_error = match std::ffi::CString::new(error_str) {
+                        Ok(cstr) => cstr,
+                        Err(_) => {
+                            return ptr::null_mut();
+                        }
+                    };
+                    c_error.into_raw()
+                }
             }
-        }));
-
-        match result {
-            Ok(p) => p,
-            Err(payload) => ffi_error_cstring(&panic_message(&*payload)),
-        }
+        })
+        .unwrap_or_else(|msg| to_c_error(&format!("embeddings: internal error (panic): {msg}")))
     }
 
     /// Frees a string returned by validate_api_key().
@@ -368,9 +355,9 @@ impl TextModelWrapper {
     /// This follows the standard Rust FFI pattern for returning owned strings to C/C++.
     pub extern "C" fn free_string(s: *mut c_char) {
         if !s.is_null() {
-            unsafe {
+            let _ = panic_guard::catch_panic(|| unsafe {
                 let _ = std::ffi::CString::from_raw(s);
-            }
+            });
         }
     }
 }
