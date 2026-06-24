@@ -191,6 +191,7 @@ function(build_embeddings_lib)
 				-DEMBEDDINGS_PDB_DST_PATH=${CMAKE_CURRENT_BINARY_DIR}/embeddings/release/lib_${EMBEDDINGS_LIB_NAME}.pdb
 				-P "${columnar_SOURCE_DIR}/cmake/copy_embeddings_artifacts.cmake"
 			DEPENDS ${EMBEDDINGS_RUST_SOURCES} "${EMBEDDINGS_VERSION_STAMP}"
+			WORKING_DIRECTORY "${columnar_SOURCE_DIR}/embeddings"
 			COMMENT "Building manticoresearch text embeddings library"
 			VERBATIM
 	)
